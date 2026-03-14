@@ -9,7 +9,7 @@ This is a DuckDB extension that enables matrix multiplication using [spalm](http
 Clone this repository with submodules:
 
 ```sh
-git clone --recurse-submodules <repo-url>
+git clone --recurse-submodules git@github.com:junyoungkim22/duckdb-spalm-release.git
 ```
 
 ## Prerequisites
