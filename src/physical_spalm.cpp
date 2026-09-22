@@ -1,4 +1,5 @@
 #include "physical_spalm.hpp"
+#include "domain_encoder.hpp"
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -51,29 +52,66 @@ void sort_row_indices(int start, int end, int* cols, T* vals) {
 }
 
 template<typename T>
-void BuildCSR(int* row_ptr, int* col_idx, T* vals,
-              ColumnDataCollection& data, int num_rows, int num_threads,
-              idx_t join_col_idx, idx_t agg_col_idx, idx_t val_col_idx,
-              std::vector<DataChunk>& t_chunks) {
+struct EncodedMatrix {
+	vector<int> row_codes;
+	vector<int> join_codes;
+	vector<T> values;
+
+	idx_t Count() const {
+		return row_codes.size();
+	}
+};
+
+template<typename T>
+EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
+                              idx_t agg_col_idx, idx_t val_col_idx,
+                              DomainEncoder &row_encoder, DomainEncoder &join_encoder) {
+	EncodedMatrix<T> result;
+	const auto input_count = data.Count();
+	result.row_codes.reserve(input_count);
+	result.join_codes.reserve(input_count);
+	result.values.reserve(input_count);
+
+	DataChunk chunk;
+	data.InitializeScanChunk(chunk);
+	for (idx_t chunk_idx = 0; chunk_idx < data.ChunkCount(); ++chunk_idx) {
+		data.FetchChunk(chunk_idx, chunk);
+		for (idx_t row_idx = 0; row_idx < chunk.size(); ++row_idx) {
+			auto join_value = chunk.data[join_col_idx].GetValue(row_idx);
+			auto matrix_value = chunk.data[val_col_idx].GetValue(row_idx);
+
+			// SQL equality joins do not match NULL keys, and SUM ignores a
+			// NULL product, so neither belongs in the matrix representation.
+			if (join_value.IsNull() || matrix_value.IsNull()) {
+				continue;
+			}
+
+			auto agg_value = chunk.data[agg_col_idx].GetValue(row_idx);
+			result.row_codes.push_back(row_encoder.Encode(agg_value));
+			result.join_codes.push_back(join_encoder.Encode(join_value));
+			result.values.push_back(matrix_value.GetValue<T>());
+		}
+	}
+	return result;
+}
+
+template<typename T>
+void BuildCSR(int *row_ptr, int *col_idx, T *vals, const EncodedMatrix<T> &matrix,
+              int num_rows, int num_threads) {
 
 	struct timespec f_start, f_end;
 
 	clock_gettime(CLOCK_MONOTONIC, &f_start);
 	std::vector<std::vector<int>> local_hist(num_threads, std::vector<int>(num_rows + 1, 0));
-	const int num_chunks = data.ChunkCount();
+	const auto entry_count = matrix.Count();
 
 	#pragma omp parallel
 	{
 		int tid = omp_get_thread_num();
 		#pragma omp for
-		for (idx_t ci = 0; ci < (idx_t)num_chunks; ci++) {
-			data.FetchChunk(ci, t_chunks[tid]);
-			const int *agg_col_input_ptr = (int *)t_chunks[tid].data[agg_col_idx].GetData();
-			const idx_t chunk_size = t_chunks[tid].size();
-			for (idx_t i = 0; i < chunk_size; i++) {
-				const int agg_idx = agg_col_input_ptr[i];
-				local_hist[tid][agg_idx + 1]++;
-			}
+		for (idx_t entry_idx = 0; entry_idx < entry_count; ++entry_idx) {
+			const int agg_idx = matrix.row_codes[entry_idx];
+			local_hist[tid][agg_idx + 1]++;
 		}
 	}
 
@@ -105,21 +143,13 @@ void BuildCSR(int* row_ptr, int* col_idx, T* vals,
 	{
 		int tid = omp_get_thread_num();
 		#pragma omp for
-		for (idx_t ci = 0; ci < (idx_t)num_chunks; ci++) {
-			data.FetchChunk(ci, t_chunks[tid]);
-			const int *join_col_input_ptr = (int *)t_chunks[tid].data[join_col_idx].GetData();
-			const int *agg_col_input_ptr = (int *)t_chunks[tid].data[agg_col_idx].GetData();
-			const T *val_col_input_ptr = (T *)t_chunks[tid].data[val_col_idx].GetData();
-			const idx_t chunk_size = t_chunks[tid].size();
-			for (idx_t i = 0; i < chunk_size; i++) {
-				const int agg_idx = agg_col_input_ptr[i];
-				const int join_idx = join_col_input_ptr[i];
-				const T val = val_col_input_ptr[i];
+		for (idx_t entry_idx = 0; entry_idx < entry_count; ++entry_idx) {
+			const int agg_idx = matrix.row_codes[entry_idx];
+			const int join_idx = matrix.join_codes[entry_idx];
 
-				int pos = row_ptr[agg_idx] + thread_offsets[tid][agg_idx]++;
-				col_idx[pos] = join_idx;
-				vals[pos] = val;
-			}
+			int pos = row_ptr[agg_idx] + thread_offsets[tid][agg_idx]++;
+			col_idx[pos] = join_idx;
+			vals[pos] = matrix.values[entry_idx];
 		}
 	}
 
@@ -238,7 +268,9 @@ public:
 	const int tile_size_agg_dim = 128;
 
 	int M, K, N;
-	int sink_max_join;  // max value of join column on sink side
+	DomainEncoder rhs_agg_encoder;
+	DomainEncoder lhs_agg_encoder;
+	DomainEncoder join_encoder;
 
 	unique_ptr<int[]> Ri;
 	unique_ptr<int[]> Rk;
@@ -314,50 +346,25 @@ SinkFinalizeType PhysicalSpalm::Finalize(Pipeline &pipeline, Event &event, Clien
 	elapsed_ms = (seconds * 1000.0) + (nanoseconds / 1000000.0);
 	printf("Start to finalize time: %.3f ms\n", elapsed_ms);
 
-	const int sink_nnz = (int)sink.mat_data->Count();
-	printf("[SPALM Finalize] mat_data chunk count=%lu, total rows (nnz)=%d\n",
-	       sink.mat_data->ChunkCount(), sink_nnz);
-
-	// Scan the collected data to find max(agg_col) and max(join_col)
 	const int num_threads = sink.threads;
 	omp_set_num_threads(num_threads);
 
-	int global_max_agg = 0;
-	int global_max_join = 0;
-	{
-		const int num_chunks = (int)sink.mat_data->ChunkCount();
-		std::vector<DataChunk> scan_chunks(num_threads);
-		for (auto &chunk : scan_chunks) {
-			sink.mat_data->InitializeScanChunk(chunk);
-		}
-		#pragma omp parallel
-		{
-			int tid = omp_get_thread_num();
-			int local_max_agg = 0;
-			int local_max_join = 0;
-			#pragma omp for
-			for (idx_t ci = 0; ci < (idx_t)num_chunks; ci++) {
-				sink.mat_data->FetchChunk(ci, scan_chunks[tid]);
-				const int *agg_ptr = (int *)scan_chunks[tid].data[sink.rhs_agg_idx].GetData();
-				const int *join_ptr = (int *)scan_chunks[tid].data[sink.rhs_join_idx].GetData();
-				const idx_t chunk_size = scan_chunks[tid].size();
-				for (idx_t i = 0; i < chunk_size; i++) {
-					if (agg_ptr[i] > local_max_agg) local_max_agg = agg_ptr[i];
-					if (join_ptr[i] > local_max_join) local_max_join = join_ptr[i];
-				}
-			}
-			#pragma omp critical
-			{
-				if (local_max_agg > global_max_agg) global_max_agg = local_max_agg;
-				if (local_max_join > global_max_join) global_max_join = local_max_join;
-			}
-		}
+	auto encoded_float = EncodedMatrix<float>();
+	auto encoded_double = EncodedMatrix<double>();
+	if (sink.use_float) {
+		encoded_float = EncodeMatrix<float>(*sink.mat_data, rhs_join_idx, rhs_agg_idx, rhs_val_idx,
+		                                    sink.rhs_agg_encoder, sink.join_encoder);
+	} else {
+		encoded_double = EncodeMatrix<double>(*sink.mat_data, rhs_join_idx, rhs_agg_idx, rhs_val_idx,
+		                                      sink.rhs_agg_encoder, sink.join_encoder);
 	}
 
-	const int M = global_max_agg + 1;
+	const int sink_nnz = sink.use_float ? static_cast<int>(encoded_float.Count())
+	                                    : static_cast<int>(encoded_double.Count());
+	const int M = static_cast<int>(sink.rhs_agg_encoder.Size());
 	sink.M = M;
-	sink.sink_max_join = global_max_join;
-	printf("[SPALM Finalize] derived M=%d, max_join=%d, nnz=%d\n", M, global_max_join, sink_nnz);
+	printf("[SPALM Finalize] encoded M=%d, K_so_far=%llu, nnz=%d\n", M,
+	       static_cast<unsigned long long>(sink.join_encoder.Size()), sink_nnz);
 
 	// Allocate sink CSR arrays
 	sink.Ri = make_uniq_array<int>(M + 1);
@@ -370,19 +377,10 @@ SinkFinalizeType PhysicalSpalm::Finalize(Pipeline &pipeline, Event &event, Clien
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &f_start);
-	std::vector<DataChunk> t_chunks(num_threads);
-	for (auto& chunk : t_chunks) {
-		sink.mat_data->InitializeScanChunk(chunk);
-	}
-
 	if (sink.use_float) {
-		BuildCSR<float>(sink.Ri.get(), sink.Rk.get(), sink.Rv_f.get(),
-		                *sink.mat_data, M, num_threads,
-		                rhs_join_idx, rhs_agg_idx, rhs_val_idx, t_chunks);
+		BuildCSR<float>(sink.Ri.get(), sink.Rk.get(), sink.Rv_f.get(), encoded_float, M, num_threads);
 	} else {
-		BuildCSR<double>(sink.Ri.get(), sink.Rk.get(), sink.Rv_d.get(),
-		                 *sink.mat_data, M, num_threads,
-		                 rhs_join_idx, rhs_agg_idx, rhs_val_idx, t_chunks);
+		BuildCSR<double>(sink.Ri.get(), sink.Rk.get(), sink.Rv_d.get(), encoded_double, M, num_threads);
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &sink.end);
@@ -469,46 +467,34 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 			const int num_threads = sink.threads;
 			omp_set_num_threads(num_threads);
 
-			// Derive operator-side dimensions from collected data
-			const int op_nnz = (int)sink.mat_data->Count();
-			int op_max_agg = 0;
-			int op_max_join = 0;
-			{
-				const int num_chunks = (int)sink.mat_data->ChunkCount();
-				std::vector<DataChunk> scan_chunks(num_threads);
-				for (auto &chunk : scan_chunks) {
-					sink.mat_data->InitializeScanChunk(chunk);
-				}
-				#pragma omp parallel
-				{
-					int tid = omp_get_thread_num();
-					int local_max_agg = 0;
-					int local_max_join = 0;
-					#pragma omp for
-					for (idx_t ci = 0; ci < (idx_t)num_chunks; ci++) {
-						sink.mat_data->FetchChunk(ci, scan_chunks[tid]);
-						const int *agg_ptr = (int *)scan_chunks[tid].data[sink.lhs_agg_idx].GetData();
-						const int *join_ptr = (int *)scan_chunks[tid].data[sink.lhs_join_idx].GetData();
-						const idx_t chunk_size = scan_chunks[tid].size();
-						for (idx_t i = 0; i < chunk_size; i++) {
-							if (agg_ptr[i] > local_max_agg) local_max_agg = agg_ptr[i];
-							if (join_ptr[i] > local_max_join) local_max_join = join_ptr[i];
-						}
-					}
-					#pragma omp critical
-					{
-						if (local_max_agg > op_max_agg) op_max_agg = local_max_agg;
-						if (local_max_join > op_max_join) op_max_join = local_max_join;
-					}
-				}
+			auto encoded_float = EncodedMatrix<float>();
+			auto encoded_double = EncodedMatrix<double>();
+			if (sink.use_float) {
+				encoded_float = EncodeMatrix<float>(*sink.mat_data, lhs_join_idx, lhs_agg_idx, lhs_val_idx,
+				                                    sink.lhs_agg_encoder, sink.join_encoder);
+			} else {
+				encoded_double = EncodeMatrix<double>(*sink.mat_data, lhs_join_idx, lhs_agg_idx, lhs_val_idx,
+				                                      sink.lhs_agg_encoder, sink.join_encoder);
 			}
 
-			const int N = op_max_agg + 1;
-			// K is the bigger of the two max join column values (+1)
-			const int K = std::max(sink.sink_max_join, op_max_join) + 1;
+			const int op_nnz = sink.use_float ? static_cast<int>(encoded_float.Count())
+			                                  : static_cast<int>(encoded_double.Count());
+			const int N = static_cast<int>(sink.lhs_agg_encoder.Size());
+			const int K = static_cast<int>(sink.join_encoder.Size());
 			sink.N = N;
 			sink.K = K;
-			printf("[SPALM FinalExecute] derived N=%d, K=%d, op_nnz=%d\n", N, K, op_nnz);
+			printf("[SPALM FinalExecute] encoded N=%d, K=%d, op_nnz=%d\n", N, K, op_nnz);
+
+			// An empty input produces no non-zero relation rows. Avoid calling
+			// the SPALM library with zero-sized dimensions; not every backend
+			// accepts them even though the SQL result is well-defined.
+			if (sink.M == 0 || N == 0 || K == 0) {
+				sink.done = true;
+				clock_gettime(CLOCK_MONOTONIC, &sink.start);
+				sink.condition.notify_all();
+				output.SetCardinality(0);
+				return OperatorFinalizeResultType::FINISHED;
+			}
 
 			// Allocate operator CSR arrays
 			sink.Sj = make_uniq_array<int>(N + 1);
@@ -536,19 +522,10 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 			}
 
 			clock_gettime(CLOCK_MONOTONIC, &f_start);
-			std::vector<DataChunk> t_chunks(num_threads);
-			for (auto& chunk : t_chunks) {
-				sink.mat_data->InitializeScanChunk(chunk);
-			}
-
 			if (sink.use_float) {
-				BuildCSR<float>(sink.Sj.get(), sink.Sk.get(), sink.Sv_f.get(),
-				                *sink.mat_data, N, num_threads,
-				                lhs_join_idx, lhs_agg_idx, lhs_val_idx, t_chunks);
+				BuildCSR<float>(sink.Sj.get(), sink.Sk.get(), sink.Sv_f.get(), encoded_float, N, num_threads);
 			} else {
-				BuildCSR<double>(sink.Sj.get(), sink.Sk.get(), sink.Sv_d.get(),
-				                 *sink.mat_data, N, num_threads,
-				                 lhs_join_idx, lhs_agg_idx, lhs_val_idx, t_chunks);
+				BuildCSR<double>(sink.Sj.get(), sink.Sk.get(), sink.Sv_d.get(), encoded_double, N, num_threads);
 			}
 
 			clock_gettime(CLOCK_MONOTONIC, &sink.end);
@@ -651,9 +628,6 @@ SourceResultType PhysicalSpalm::GetData(ExecutionContext &context, DataChunk &ou
 	const idx_t vec_size  = 2048;
 
 	output.SetCapacity(vec_size);
-	// Use dynamic output indices: rhs_output_idx for M dimension (ai), lhs_output_idx for N dimension (bj)
-	int *out_m_dim = (int *)output.data[rhs_output_idx].GetData();  // ai
-	int *out_n_dim = (int *)output.data[lhs_output_idx].GetData();  // bj
 	idx_t idx = 0;
 
 	if (sink.use_float) {
@@ -670,8 +644,10 @@ SourceResultType PhysicalSpalm::GetData(ExecutionContext &context, DataChunk &ou
 			}
 			while (lstate.curr_pos < lstate.end_pos && idx < vec_size) {
 				if (res[lstate.curr_pos] != 0) {
-					out_m_dim[idx] = (int)(lstate.curr_pos / N);
-					out_n_dim[idx] = (int)(lstate.curr_pos % N);
+					const auto m_code = lstate.curr_pos / N;
+					const auto n_code = lstate.curr_pos % N;
+					output.data[rhs_output_idx].SetValue(idx, sink.rhs_agg_encoder.Decode(m_code));
+					output.data[lhs_output_idx].SetValue(idx, sink.lhs_agg_encoder.Decode(n_code));
 					out_val[idx] = res[lstate.curr_pos];
 					idx++;
 				}
@@ -692,8 +668,10 @@ SourceResultType PhysicalSpalm::GetData(ExecutionContext &context, DataChunk &ou
 			}
 			while (lstate.curr_pos < lstate.end_pos && idx < vec_size) {
 				if (res[lstate.curr_pos] != 0) {
-					out_m_dim[idx] = (int)(lstate.curr_pos / N);
-					out_n_dim[idx] = (int)(lstate.curr_pos % N);
+					const auto m_code = lstate.curr_pos / N;
+					const auto n_code = lstate.curr_pos % N;
+					output.data[rhs_output_idx].SetValue(idx, sink.rhs_agg_encoder.Decode(m_code));
+					output.data[lhs_output_idx].SetValue(idx, sink.lhs_agg_encoder.Decode(n_code));
 					out_val[idx] = res[lstate.curr_pos];
 					idx++;
 				}
