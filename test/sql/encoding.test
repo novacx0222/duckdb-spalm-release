@@ -1,0 +1,91 @@
+# name: test/sql/encoding.test
+# description: On-the-fly domain encoding and output decoding for SPALM
+# group: [spalm]
+
+require spalm
+
+statement ok
+SET preserve_insertion_order = false
+
+statement ok
+SET disabled_optimizers = 'compressed_materialization,statistics_propagation'
+
+statement ok
+SET threads = 2
+
+# VARCHAR output and join dimensions are encoded for CSR and decoded on output.
+# The unmatched keys also verify that both inputs use one shared k dictionary.
+statement ok
+CREATE TABLE string_a(ai VARCHAR, ak VARCHAR, av DOUBLE)
+
+statement ok
+INSERT INTO string_a VALUES
+    ('alice', 'red', 2),
+    ('alice', 'blue', 1),
+    ('bob', 'red', 3),
+    ('ignored', 'green', 99)
+
+statement ok
+CREATE TABLE string_b(bj VARCHAR, bk VARCHAR, bv DOUBLE)
+
+statement ok
+INSERT INTO string_b VALUES
+    ('book', 'red', 4),
+    ('book', 'blue', 5),
+    ('pen', 'blue', 2),
+    ('ignored-item', 'yellow', 99)
+
+query TTR
+SELECT ai, bj, SUM(av * bv) AS score
+FROM string_a JOIN string_b ON ak = bk
+GROUP BY ai, bj
+ORDER BY ai, bj
+----
+alice	book	13.0
+alice	pen	2.0
+bob	book	12.0
+
+# Large sparse integer IDs should be compressed instead of being used as array
+# offsets. Filters are evaluated before the SPALM operator receives its input.
+statement ok
+CREATE TABLE sparse_a(ai BIGINT, ak BIGINT, av DOUBLE, keep BOOLEAN)
+
+statement ok
+INSERT INTO sparse_a VALUES
+    (1000000000, 9000000000, 2, true),
+    (1000000000, 8000000000, 1, true),
+    (2000000000, 9000000000, 3, true),
+    (7777777777, 9000000000, 100, false)
+
+statement ok
+CREATE TABLE sparse_b(bj BIGINT, bk BIGINT, bv DOUBLE, keep BOOLEAN)
+
+statement ok
+INSERT INTO sparse_b VALUES
+    (3000000000, 9000000000, 4, true),
+    (3000000000, 8000000000, 5, true),
+    (4000000000, 8000000000, 2, true),
+    (8888888888, 9000000000, 100, false)
+
+query IIR
+SELECT ai, bj, SUM(av * bv) AS score
+FROM sparse_a JOIN sparse_b ON ak = bk
+WHERE sparse_a.keep AND sparse_b.keep
+GROUP BY ai, bj
+ORDER BY ai, bj
+----
+1000000000	3000000000	13.0
+1000000000	4000000000	2.0
+2000000000	3000000000	12.0
+
+# A completely empty encoded dimension returns an empty relation without
+# invoking the SPALM backend with a zero-sized matrix.
+statement ok
+CREATE TABLE empty_a(ai VARCHAR, ak VARCHAR, av DOUBLE)
+
+query TTR
+SELECT ai, bj, SUM(av * bv) AS score
+FROM empty_a JOIN string_b ON ak = bk
+GROUP BY ai, bj
+ORDER BY ai, bj
+----

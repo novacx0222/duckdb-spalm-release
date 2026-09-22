@@ -57,3 +57,15 @@ GROUP BY ai, bj;
 ```
 
 This computes `C = A * B` where the shared dimension `k` is matched via the join predicate `ak = bk`, and the result is grouped by output row `ai` and column `bj`.
+
+## Dimension Encoding
+
+We extended SPALM so that Matrix dimension columns no longer need to be pre-encoded dense integers.
+The physical SPALM operator builds query-local, zero-based dictionary codes for the two output dimensions and the shared join dimension.
+Both inputs use the same dictionary for the join dimension.
+Result row and column codes are decoded to the original SQL values before they leave the operator.
+
+For example, `VARCHAR` username, feature, and item identifiers can be used directly in the join-aggregate query above.
+Sparse integer identifiers such as `1000000000` and `9000000000` are compressed as well, so matrix dimensions are based on the number of distinct values rather than `MAX(identifier) + 1`.
+
+Filters pushed into the input scans run before this query-local encoding, which keeps the dictionaries and CSR inputs limited to the selected data.
