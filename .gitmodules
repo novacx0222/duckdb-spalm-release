@@ -8,4 +8,4 @@
 	branch = main
 [submodule "spalm-release"]
 	path = spalm-release
-	url = git@github.com:junyoungkim22/spalm-release.git
+	url = git@github.com:novacx0222/spalm-release.git
