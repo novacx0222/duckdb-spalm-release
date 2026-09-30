@@ -21,22 +21,10 @@ CREATE TABLE U
 );
 
 INSERT INTO R
-VALUES (0, 0, 1.0),
-       (0, 0, 100.0);
+VALUES (-1, -1, 1.0);
 
 INSERT INTO U
-VALUES (0, 0, 2.0),
-       (0, 0, 3.0);
-
-SELECT i, k, COUNT(*) AS multiplicity
-FROM R
-GROUP BY i, k
-HAVING COUNT(*) > 1;
-
-SELECT k, j, COUNT(*) AS multiplicity
-FROM U
-GROUP BY k, j
-HAVING COUNT(*) > 1;
+VALUES (-1, -1, 1.0);
 
 EXPLAIN
 SELECT R.i, U.j, SUM(R.u * U.v) AS total
