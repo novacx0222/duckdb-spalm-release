@@ -68,8 +68,10 @@ EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
                               DomainEncoder &row_encoder, DomainEncoder &join_encoder) {
 	EncodedMatrix<T> result;
 	const auto input_count = data.Count();
-	result.row_codes.reserve(input_count);
-	result.join_codes.reserve(input_count);
+	vector<Value> row_values;
+	vector<Value> join_values;
+	row_values.reserve(input_count);
+	join_values.reserve(input_count);
 	result.values.reserve(input_count);
 
 	DataChunk chunk;
@@ -87,11 +89,13 @@ EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
 			}
 
 			auto agg_value = chunk.data[agg_col_idx].GetValue(row_idx);
-			result.row_codes.push_back(row_encoder.Encode(agg_value));
-			result.join_codes.push_back(join_encoder.Encode(join_value));
+			row_values.push_back(std::move(agg_value));
+			join_values.push_back(std::move(join_value));
 			result.values.push_back(matrix_value.GetValue<T>());
 		}
 	}
+	result.row_codes = row_encoder.EncodeBatch(std::move(row_values));
+	result.join_codes = join_encoder.EncodeBatch(std::move(join_values));
 	return result;
 }
 
@@ -479,6 +483,10 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 
 			const int op_nnz = sink.use_float ? static_cast<int>(encoded_float.Count())
 			                                  : static_cast<int>(encoded_double.Count());
+			#pragma omp parallel for
+			for (idx_t entry = 0; entry < static_cast<idx_t>(sink.Ri[sink.M]); ++entry) {
+				sink.Rk[entry] = sink.join_encoder.Remap(sink.Rk[entry]);
+			}
 			const int N = static_cast<int>(sink.lhs_agg_encoder.Size());
 			const int K = static_cast<int>(sink.join_encoder.Size());
 			sink.N = N;
