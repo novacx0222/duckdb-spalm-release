@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <unordered_map>
 #include <string>
+#include <cstdio>
 
 namespace duckdb {
 
@@ -25,6 +26,16 @@ double get_ms(struct timespec start, struct timespec end) {
 	seconds = end.tv_sec - start.tv_sec;
 	nanoseconds = end.tv_nsec - start.tv_nsec;
 	return (seconds * 1000.0) + (nanoseconds / 1000000.0);
+}
+
+static timespec timing_now() {
+  timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t;
+}
+static void print_stage(const char *name, timespec begin, timespec end) {
+  printf("[%s] %.3f ms\n", name, get_ms(begin, end));
+}
+static void print_side(int side, const char *name, timespec begin, timespec end) {
+  printf("[%d-%s] %.3f ms\n", side, name, get_ms(begin, end));
 }
 
 template<typename T>
@@ -65,44 +76,79 @@ struct EncodedMatrix {
 template<typename T>
 EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
                               idx_t agg_col_idx, idx_t val_col_idx,
-                              DomainEncoder &row_encoder, DomainEncoder &join_encoder) {
-	EncodedMatrix<T> result;
-	const auto input_count = data.Count();
-	result.row_codes.reserve(input_count);
-	result.join_codes.reserve(input_count);
-	result.values.reserve(input_count);
-
-	DataChunk chunk;
-	data.InitializeScanChunk(chunk);
-	for (idx_t chunk_idx = 0; chunk_idx < data.ChunkCount(); ++chunk_idx) {
-		data.FetchChunk(chunk_idx, chunk);
-		for (idx_t row_idx = 0; row_idx < chunk.size(); ++row_idx) {
-			auto join_value = chunk.data[join_col_idx].GetValue(row_idx);
-			auto matrix_value = chunk.data[val_col_idx].GetValue(row_idx);
-
-			// SQL equality joins do not match NULL keys, and SUM ignores a
-			// NULL product, so neither belongs in the matrix representation.
-			if (join_value.IsNull() || matrix_value.IsNull()) {
-				continue;
-			}
-
-			auto agg_value = chunk.data[agg_col_idx].GetValue(row_idx);
-			result.row_codes.push_back(row_encoder.Encode(agg_value));
-			result.join_codes.push_back(join_encoder.Encode(join_value));
-			result.values.push_back(matrix_value.GetValue<T>());
-		}
-	}
-	return result;
+                              DomainEncoder &row_encoder, DomainEncoder &join_encoder,
+                              int timing_side) {
+    const auto encoding_begin = timing_now();
+    EncodedMatrix<T> result;
+    const auto input_count = data.Count();
+    result.row_codes.reserve(input_count);
+    result.join_codes.reserve(input_count);
+    result.values.reserve(input_count);
+    // Bound temporary Values to one existing chunk, not the complete input.
+    vector<Value> row_values;
+    vector<Value> join_values;
+    DataChunk chunk;
+    data.InitializeScanChunk(chunk);
+    double allocate_ms = get_ms(encoding_begin, timing_now());
+    double extract_ms = 0.0, row_ms = 0.0, join_ms = 0.0;
+    const auto old_row_size = row_encoder.Size();
+    const auto old_join_size = join_encoder.Size();
+    for (idx_t chunk_idx = 0; chunk_idx < data.ChunkCount(); ++chunk_idx) {
+        auto begin = timing_now();
+        data.FetchChunk(chunk_idx, chunk);
+        extract_ms += get_ms(begin, timing_now());
+        begin = timing_now();
+        row_values.reserve(chunk.size());
+        join_values.reserve(chunk.size());
+        allocate_ms += get_ms(begin, timing_now());
+        begin = timing_now();
+        row_values.clear();
+        join_values.clear();
+        for (idx_t row_idx = 0; row_idx < chunk.size(); ++row_idx) {
+            auto join_value = chunk.data[join_col_idx].GetValue(row_idx);
+            auto matrix_value = chunk.data[val_col_idx].GetValue(row_idx);
+            // Preserve SQL NULL semantics and the original per-domain input order.
+            if (join_value.IsNull() || matrix_value.IsNull()) continue;
+            row_values.push_back(chunk.data[agg_col_idx].GetValue(row_idx));
+            join_values.push_back(std::move(join_value));
+            result.values.push_back(matrix_value.GetValue<T>());
+        }
+        extract_ms += get_ms(begin, timing_now());
+        begin = timing_now();
+        for (auto &value : row_values) result.row_codes.push_back(row_encoder.Encode(value));
+        row_ms += get_ms(begin, timing_now());
+        begin = timing_now();
+        for (auto &value : join_values) result.join_codes.push_back(join_encoder.Encode(value));
+        join_ms += get_ms(begin, timing_now());
+    }
+    const auto temporary_release_begin = timing_now();
+    vector<Value>().swap(row_values);
+    vector<Value>().swap(join_values);
+    print_side(timing_side, "array-temporary-deallocate", temporary_release_begin, timing_now());
+    printf("[%d-array-allocate] %.3f ms\n", timing_side, allocate_ms);
+    printf("[%d-array-extract] %.3f ms\n", timing_side, extract_ms);
+    printf("[%d-row-encode] %.3f ms\n", timing_side, row_ms);
+    printf("[%d-join-encode] %.3f ms\n", timing_side, join_ms);
+    print_side(timing_side, "encoding-total", encoding_begin, timing_now());
+    printf("[%d-row-encode-stats] calls=%llu new_keys=%llu\n", timing_side,
+           static_cast<unsigned long long>(result.row_codes.size()),
+           static_cast<unsigned long long>(row_encoder.Size() - old_row_size));
+    printf("[%d-join-encode-stats] calls=%llu new_keys=%llu\n", timing_side,
+           static_cast<unsigned long long>(result.join_codes.size()),
+           static_cast<unsigned long long>(join_encoder.Size() - old_join_size));
+    return result;
 }
 
 template<typename T>
 void BuildCSR(int *row_ptr, int *col_idx, T *vals, const EncodedMatrix<T> &matrix,
-              int num_rows, int num_threads) {
+              int num_rows, int num_threads, int timing_side) {
 
 	struct timespec f_start, f_end;
 
 	clock_gettime(CLOCK_MONOTONIC, &f_start);
 	std::vector<std::vector<int>> local_hist(num_threads, std::vector<int>(num_rows + 1, 0));
+	print_side(timing_side, "csr-histogram-allocate", f_start, timing_now());
+	const auto count_begin = timing_now();
 	const auto entry_count = matrix.Count();
 
 	#pragma omp parallel
@@ -115,6 +161,8 @@ void BuildCSR(int *row_ptr, int *col_idx, T *vals, const EncodedMatrix<T> &matri
 		}
 	}
 
+	print_side(timing_side, "csr-row-count", count_begin, timing_now());
+	const auto prefix_begin = timing_now();
 	for (int t = 0; t < num_threads; t++) {
 		for (int r = 0; r <= num_rows; r++) {
 			row_ptr[r] += local_hist[t][r];
@@ -136,7 +184,8 @@ void BuildCSR(int *row_ptr, int *col_idx, T *vals, const EncodedMatrix<T> &matri
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &f_end);
-	printf("CSR offset counting time: %.3f ms\n", get_ms(f_start, f_end));
+	print_side(timing_side, "csr-prefix-offset", prefix_begin, f_end);
+	print_side(timing_side, "csr-count-total", f_start, f_end);
 
 	clock_gettime(CLOCK_MONOTONIC, &f_start);
 	#pragma omp parallel
@@ -154,7 +203,7 @@ void BuildCSR(int *row_ptr, int *col_idx, T *vals, const EncodedMatrix<T> &matri
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &f_end);
-	printf("CSR writing time: %.3f ms\n", get_ms(f_start, f_end));
+	print_side(timing_side, "csr-write", f_start, f_end);
 
 	clock_gettime(CLOCK_MONOTONIC, &f_start);
 	#pragma omp parallel for schedule(dynamic)
@@ -162,7 +211,7 @@ void BuildCSR(int *row_ptr, int *col_idx, T *vals, const EncodedMatrix<T> &matri
 		sort_row_indices<T>(row_ptr[r], row_ptr[r+1], col_idx, vals);
 	}
 	clock_gettime(CLOCK_MONOTONIC, &f_end);
-	printf("CSR sorting time: %.3f ms\n", get_ms(f_start, f_end));
+	print_side(timing_side, "csr-sort", f_start, f_end);
 }
 
 // Parse spalm.conf into a key->value map.
@@ -252,6 +301,7 @@ public:
 		M = 0; K = 0; N = 0;
 
 		clock_gettime(CLOCK_MONOTONIC, &start);
+		prepare_start = start;
 	}
 
 	~PhysicalSpalmGlobalState() {
@@ -291,9 +341,12 @@ public:
 	int total_parallel_operators;
 
 	struct timespec start, end;
+	struct timespec prepare_start;
 
 	unique_ptr<ColumnDataCollection> mat_data;
 	ColumnDataAppendState append_state;
+	double combine_ms = 0.0;
+	double operator_combine_ms = 0.0;
 	mutex lock;
 	std::condition_variable condition;
 	int threads_done = 0;
@@ -331,7 +384,9 @@ SinkCombineResultType PhysicalSpalm::Combine(ExecutionContext &context, Operator
 	auto &sink = input.global_state.Cast<PhysicalSpalmGlobalState>();
 	auto &lstate = input.local_state.Cast<PhysicalSpalmLocalState>();
 	lock_guard<mutex> client_guard(sink.lock);
+	const auto combine_begin = timing_now();
 	sink.mat_data->Combine(lstate.l_mat_data);
+	sink.combine_ms += get_ms(combine_begin, timing_now());
 	return SinkCombineResultType::FINISHED;
 }
 
@@ -344,7 +399,8 @@ SinkFinalizeType PhysicalSpalm::Finalize(Pipeline &pipeline, Event &event, Clien
 	seconds = sink.end.tv_sec - sink.start.tv_sec;
 	nanoseconds = sink.end.tv_nsec - sink.start.tv_nsec;
 	elapsed_ms = (seconds * 1000.0) + (nanoseconds / 1000000.0);
-	printf("Start to finalize time: %.3f ms\n", elapsed_ms);
+	printf("[1-collect-input] %.3f ms\n", elapsed_ms);
+	printf("[1-combine-input] %.3f ms\n", sink.combine_ms);
 
 	const int num_threads = sink.threads;
 	omp_set_num_threads(num_threads);
@@ -353,10 +409,10 @@ SinkFinalizeType PhysicalSpalm::Finalize(Pipeline &pipeline, Event &event, Clien
 	auto encoded_double = EncodedMatrix<double>();
 	if (sink.use_float) {
 		encoded_float = EncodeMatrix<float>(*sink.mat_data, rhs_join_idx, rhs_agg_idx, rhs_val_idx,
-		                                    sink.rhs_agg_encoder, sink.join_encoder);
+		                                    sink.rhs_agg_encoder, sink.join_encoder, 1);
 	} else {
 		encoded_double = EncodeMatrix<double>(*sink.mat_data, rhs_join_idx, rhs_agg_idx, rhs_val_idx,
-		                                      sink.rhs_agg_encoder, sink.join_encoder);
+		                                      sink.rhs_agg_encoder, sink.join_encoder, 1);
 	}
 
 	const int sink_nnz = sink.use_float ? static_cast<int>(encoded_float.Count())
@@ -366,6 +422,7 @@ SinkFinalizeType PhysicalSpalm::Finalize(Pipeline &pipeline, Event &event, Clien
 	printf("[SPALM Finalize] encoded M=%d, K_so_far=%llu, nnz=%d\n", M,
 	       static_cast<unsigned long long>(sink.join_encoder.Size()), sink_nnz);
 
+	const auto csr_allocate_begin = timing_now();
 	// Allocate sink CSR arrays
 	sink.Ri = make_uniq_array<int>(M + 1);
 	memset(sink.Ri.get(), 0, sizeof(int) * (M + 1));
@@ -376,15 +433,16 @@ SinkFinalizeType PhysicalSpalm::Finalize(Pipeline &pipeline, Event &event, Clien
 		sink.Rv_d = make_uniq_array<double>(sink_nnz);
 	}
 
+	print_stage("1-csr-allocate", csr_allocate_begin, timing_now());
 	clock_gettime(CLOCK_MONOTONIC, &f_start);
 	if (sink.use_float) {
-		BuildCSR<float>(sink.Ri.get(), sink.Rk.get(), sink.Rv_f.get(), encoded_float, M, num_threads);
+		BuildCSR<float>(sink.Ri.get(), sink.Rk.get(), sink.Rv_f.get(), encoded_float, M, num_threads, 1);
 	} else {
-		BuildCSR<double>(sink.Ri.get(), sink.Rk.get(), sink.Rv_d.get(), encoded_double, M, num_threads);
+		BuildCSR<double>(sink.Ri.get(), sink.Rk.get(), sink.Rv_d.get(), encoded_double, M, num_threads, 1);
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &sink.end);
-	printf("1 CSR init time: %.3f ms\n", get_ms(sink.start, sink.end));
+	print_stage("1-prepare-total", sink.start, sink.end);
 
 	// Reinitialize mat_data with LHS child types for the operator phase
 	sink.mat_data = make_uniq<ColumnDataCollection>(sink.context_ref, sink.lhs_child_types);
@@ -454,7 +512,9 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 
 	if (!sink.done) {
 		unique_lock<mutex> l(sink.lock);
+		const auto combine_begin = timing_now();
 		sink.mat_data->Combine(op_state.r_mat_data);
+		sink.operator_combine_ms += get_ms(combine_begin, timing_now());
 		sink.threads_done++;
 
 		// If we aren't the last thread, we wait.
@@ -467,14 +527,16 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 			const int num_threads = sink.threads;
 			omp_set_num_threads(num_threads);
 
+			print_stage("2-collect-input", sink.start, timing_now());
+			printf("[2-combine-input] %.3f ms\n", sink.operator_combine_ms);
 			auto encoded_float = EncodedMatrix<float>();
 			auto encoded_double = EncodedMatrix<double>();
 			if (sink.use_float) {
 				encoded_float = EncodeMatrix<float>(*sink.mat_data, lhs_join_idx, lhs_agg_idx, lhs_val_idx,
-				                                    sink.lhs_agg_encoder, sink.join_encoder);
+				                                    sink.lhs_agg_encoder, sink.join_encoder, 2);
 			} else {
 				encoded_double = EncodeMatrix<double>(*sink.mat_data, lhs_join_idx, lhs_agg_idx, lhs_val_idx,
-				                                      sink.lhs_agg_encoder, sink.join_encoder);
+				                                      sink.lhs_agg_encoder, sink.join_encoder, 2);
 			}
 
 			const int op_nnz = sink.use_float ? static_cast<int>(encoded_float.Count())
@@ -496,6 +558,7 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 				return OperatorFinalizeResultType::FINISHED;
 			}
 
+			const auto csr_allocate_begin = timing_now();
 			// Allocate operator CSR arrays
 			sink.Sj = make_uniq_array<int>(N + 1);
 			memset(sink.Sj.get(), 0, sizeof(int) * (N + 1));
@@ -506,31 +569,39 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 				sink.Sv_d = make_uniq_array<double>(op_nnz);
 			}
 
+			print_stage("2-csr-allocate", csr_allocate_begin, timing_now());
 			// Allocate result array (M x N)
 			{
 				struct timespec alloc_start, alloc_end;
 				clock_gettime(CLOCK_MONOTONIC, &alloc_start);
 				if (sink.use_float) {
 					sink.result_f = make_uniq_array<float>((idx_t)sink.M * N);
+					const auto zero_begin = timing_now();
+					print_stage("result-allocate", alloc_start, zero_begin);
 					memset(sink.result_f.get(), 0, sizeof(float) * (idx_t)sink.M * N);
+					print_stage("result-zero", zero_begin, timing_now());
 				} else {
 					sink.result_d = make_uniq_array<double>((idx_t)sink.M * N);
+					const auto zero_begin = timing_now();
+					print_stage("result-allocate", alloc_start, zero_begin);
 					memset(sink.result_d.get(), 0, sizeof(double) * (idx_t)sink.M * N);
+					print_stage("result-zero", zero_begin, timing_now());
 				}
 				clock_gettime(CLOCK_MONOTONIC, &alloc_end);
-				printf("Result memset + allocation time: %.3f ms\n", get_ms(alloc_start, alloc_end));
+				print_stage("result-allocate-zero-total", alloc_start, alloc_end);
 			}
 
 			clock_gettime(CLOCK_MONOTONIC, &f_start);
 			if (sink.use_float) {
-				BuildCSR<float>(sink.Sj.get(), sink.Sk.get(), sink.Sv_f.get(), encoded_float, N, num_threads);
+				BuildCSR<float>(sink.Sj.get(), sink.Sk.get(), sink.Sv_f.get(), encoded_float, N, num_threads, 2);
 			} else {
-				BuildCSR<double>(sink.Sj.get(), sink.Sk.get(), sink.Sv_d.get(), encoded_double, N, num_threads);
+				BuildCSR<double>(sink.Sj.get(), sink.Sk.get(), sink.Sv_d.get(), encoded_double, N, num_threads, 2);
 			}
 
 			clock_gettime(CLOCK_MONOTONIC, &sink.end);
-			printf("2 CSR init time: %.3f ms\n", get_ms(sink.start, sink.end));
+			print_stage("2-prepare-total", sink.start, sink.end);
 
+			const auto library_setup_begin = timing_now();
 			// Load spalm library from path configured in spalm.conf.
 			// Keep the handle cached for the process lifetime to avoid
 			// unloading MKL (which corrupts its internal thread pool state).
@@ -588,6 +659,9 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 			void *sv_ptr = sink.use_float ? (void *)sink.Sv_f.get() : (void *)sink.Sv_d.get();
 			void *result_ptr = sink.use_float ? (void *)sink.result_f.get() : (void *)sink.result_d.get();
 
+			const auto library_call_begin = timing_now();
+			print_stage("library-config-setup", library_setup_begin, library_call_begin);
+			print_stage("prepare-total", sink.prepare_start, library_call_begin);
 			spalm_fn(spalm_type, sink.Ri.get(), sink.Rk.get(), rv_ptr,
 			         sink.Sj.get(), sink.Sk.get(), sv_ptr,
 			         sink.M, sink.K, sink.N,
@@ -595,6 +669,7 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 			         result_ptr, nullptr, nullptr, nullptr,
 			         (int)c_keys.size(), c_keys.data(), c_vals.data());
 
+			print_stage("library-call-total", library_call_begin, timing_now());
 			sink.done = true;
 			clock_gettime(CLOCK_MONOTONIC, &sink.start);
 			sink.condition.notify_all();
@@ -686,7 +761,7 @@ SourceResultType PhysicalSpalm::GetData(ExecutionContext &context, DataChunk &ou
 	if (all_done) {
 		if (++gstate.threads_finished == gstate.num_threads) {
 			clock_gettime(CLOCK_MONOTONIC, &sink.end);
-			printf("Output time: %.3f ms\n", get_ms(sink.start, sink.end));
+			print_stage("output-total", sink.start, sink.end);
 		}
 		return SourceResultType::FINISHED;
 	}
