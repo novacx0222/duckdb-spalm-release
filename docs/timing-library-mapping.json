@@ -1,0 +1,197 @@
+[
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "CSR transpose: ",
+    "new": "[mkl-csr-transpose]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "Sparse MM time: ",
+    "new": "[mkl-sparse-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "Total Sparse MM: ",
+    "new": "[mkl-total-sparse-mm]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "BSR creation: ",
+    "new": "[mkl-bsr-creation]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "BSR transpose: ",
+    "new": "[mkl-bsr-transpose]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "Sparse MM time: ",
+    "new": "[mkl-sparse-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "Total Sparse MM: ",
+    "new": "[mkl-total-sparse-mm]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "S transpose: ",
+    "new": "[mkl-s-transpose]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "Sparse-Dense MM time: ",
+    "new": "[mkl-sparse-dense-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "S transpose: ",
+    "new": "[mkl-s-transpose]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "Sparse-Dense MM time: ",
+    "new": "[mkl-sparse-dense-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "Dense MM time: ",
+    "new": "[mkl-dense-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "Dense MM time: ",
+    "new": "[mkl-dense-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/run_baseline.cpp",
+    "old": "E2E MM time: ",
+    "new": "[mkl-baseline-total]"
+  },
+  {
+    "file": "spalm-release/src/cpu/dense_dense_matmul.cpp",
+    "old": "Memory allocation time: ",
+    "new": "[dense-dense-memory-allocation-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/dense_dense_matmul.cpp",
+    "old": "Dense MM time: ",
+    "new": "[dense-dense-dense-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/dense_dense_matmul.cpp",
+    "old": "Total dense MM time: ",
+    "new": "[dense-dense-total-dense-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/spalm.cpp",
+    "old": "Total ss_matrix init time: ",
+    "new": "[slice-prepare-total]"
+  },
+  {
+    "file": "spalm-release/src/cpu/spalm.cpp",
+    "old": "MM check time: ",
+    "new": "[mm-select-total]"
+  },
+  {
+    "file": "spalm-release/src/cpu/spalm.cpp",
+    "old": "Mem allocation time for MKL: ",
+    "new": "[mkl-dense-input-allocate]"
+  },
+  {
+    "file": "spalm-release/src/cpu/spalm.cpp",
+    "old": "Matrix initialization for MKL: ",
+    "new": "[mkl-dense-input-fill]"
+  },
+  {
+    "file": "spalm-release/src/cpu/spalm.cpp",
+    "old": "Fallback MM: ",
+    "new": "[mkl-call-total]"
+  },
+  {
+    "file": "spalm-release/src/cpu/spalm.cpp",
+    "old": "Fallback MM: ",
+    "new": "[mkl-call-total]"
+  },
+  {
+    "file": "spalm-release/src/cpu/spalm.cpp",
+    "old": "Total MM time: ",
+    "new": "[mm-total]"
+  },
+  {
+    "file": "spalm-release/src/cpu/spalm.cpp",
+    "old": "E2E MM time: ",
+    "new": "[slice-mm-total]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "Memory allocation time: ",
+    "new": "[sparse-sparse-memory-allocation-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "Stuff up to counting: ",
+    "new": "[sparse-sparse-stuff-up-to-counting]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "S transpose time: ",
+    "new": "[sparse-sparse-s-transpose-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "Sparse MM time: ",
+    "new": "[sparse-sparse-sparse-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "Total Sparse MM time: ",
+    "new": "[sparse-sparse-total-sparse-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "S_T count + alloc: ",
+    "new": "[sparse-sparse-s_t-count-alloc]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "S_T copy + transpose: ",
+    "new": "[sparse-sparse-s_t-copy-transpose]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "S transpose time: ",
+    "new": "[sparse-sparse-s-transpose-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "R subrow labeling time: ",
+    "new": "[sparse-sparse-r-subrow-labeling-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "Sparse MM time: ",
+    "new": "[sparse-sparse-sparse-mm-time]"
+  },
+  {
+    "file": "spalm-release/src/cpu/sparse_sparse_matmul.cpp",
+    "old": "Total Sparse MM time: ",
+    "new": "[sparse-sparse-total-sparse-mm-time]"
+  },
+  {
+    "file": "spalm-release/include/ss_mat.h",
+    "old": "Subrow CSR creation time: ",
+    "new": "[slice-subrow-csr-creation-time-cumulative]"
+  },
+  {
+    "file": "spalm-release/include/ss_mat.h",
+    "old": "Subrow CSC creation time: ",
+    "new": "[slice-subrow-csc-creation-time-cumulative]"
+  },
+  {
+    "file": "spalm-release/include/ss_mat.h",
+    "old": "Slice CSC creation time: ",
+    "new": "[slice-slice-csc-creation-time-cumulative]"
+  }
+]
