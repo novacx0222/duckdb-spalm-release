@@ -73,6 +73,59 @@ struct EncodedMatrix {
 	}
 };
 
+
+// Integer columns retain primitive values; other SQL types retain Value.
+// Dispatch is chosen once from column metadata, before scanning records.
+struct DomainInputBuffer {
+	explicit DomainInputBuffer(const LogicalType &type, idx_t count) : type(type), reader(nullptr) {
+		switch (type.id()) {
+		case LogicalTypeId::TINYINT: reader = Read<int8_t>; break;
+		case LogicalTypeId::SMALLINT: reader = Read<int16_t>; break;
+		case LogicalTypeId::INTEGER: reader = Read<int32_t>; break;
+		case LogicalTypeId::BIGINT: reader = Read<int64_t>; break;
+		case LogicalTypeId::UTINYINT: reader = Read<uint8_t>; break;
+		case LogicalTypeId::USMALLINT: reader = Read<uint16_t>; break;
+		case LogicalTypeId::UINTEGER: reader = Read<uint32_t>; break;
+		default: break;
+		}
+		if (reader) {
+			integers.reserve(count);
+			valid.reserve(count);
+		} else {
+			values.reserve(count);
+		}
+	}
+
+	template <class T>
+	static int64_t Read(const UnifiedVectorFormat &format, idx_t index) {
+		return static_cast<int64_t>(UnifiedVectorFormat::GetData<T>(format)[index]);
+	}
+
+	void Append(Vector &column, const UnifiedVectorFormat &format, idx_t logical_index) {
+		if (reader) {
+			const auto index = format.sel->get_index(logical_index);
+			const bool is_valid = format.validity.RowIsValid(index);
+			valid.push_back(is_valid ? 1 : 0);
+			integers.push_back(is_valid ? reader(format, index) : 0);
+		} else {
+			values.push_back(column.GetValue(logical_index));
+		}
+	}
+
+	vector<int> Encode(DomainEncoder &encoder, int side, const char *domain) {
+		if (reader) {
+			return encoder.EncodeIntegerBatch(std::move(integers), std::move(valid), type, side, domain);
+		}
+		return encoder.EncodeBatch(std::move(values), side, domain);
+	}
+
+	LogicalType type;
+	int64_t (*reader)(const UnifiedVectorFormat &, idx_t);
+	vector<int64_t> integers;
+	vector<uint8_t> valid;
+	vector<Value> values;
+};
+
 template<typename T>
 EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
                               idx_t agg_col_idx, idx_t val_col_idx,
@@ -81,40 +134,37 @@ EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
 	const auto allocate_begin = encoding_begin;
 	EncodedMatrix<T> result;
 	const auto input_count = data.Count();
-	vector<Value> row_values;
-	vector<Value> join_values;
-	row_values.reserve(input_count);
-	join_values.reserve(input_count);
+	DataChunk chunk;
+	data.InitializeScanChunk(chunk);
+	DomainInputBuffer row_values(chunk.data[agg_col_idx].GetType(), input_count);
+	DomainInputBuffer join_values(chunk.data[join_col_idx].GetType(), input_count);
 	result.values.reserve(input_count);
 
 	print_side(timing_side, "array-allocate", allocate_begin, timing_now());
 	const auto extract_begin = timing_now();
-	DataChunk chunk;
-	data.InitializeScanChunk(chunk);
 	for (idx_t chunk_idx = 0; chunk_idx < data.ChunkCount(); ++chunk_idx) {
 		data.FetchChunk(chunk_idx, chunk);
+		UnifiedVectorFormat row_format, join_format;
+		chunk.data[agg_col_idx].ToUnifiedFormat(chunk.size(), row_format);
+		chunk.data[join_col_idx].ToUnifiedFormat(chunk.size(), join_format);
 		for (idx_t row_idx = 0; row_idx < chunk.size(); ++row_idx) {
-			auto join_value = chunk.data[join_col_idx].GetValue(row_idx);
+			const auto join_index = join_format.sel->get_index(row_idx);
+			if (!join_format.validity.RowIsValid(join_index)) continue;
 			auto matrix_value = chunk.data[val_col_idx].GetValue(row_idx);
-
-			// SQL equality joins do not match NULL keys, and SUM ignores a
-			// NULL product, so neither belongs in the matrix representation.
-			if (join_value.IsNull() || matrix_value.IsNull()) {
-				continue;
-			}
-
-			auto agg_value = chunk.data[agg_col_idx].GetValue(row_idx);
-			row_values.push_back(std::move(agg_value));
-			join_values.push_back(std::move(join_value));
+			// Equality joins reject NULL keys; SUM ignores NULL products.
+			// NULL grouping keys remain valid domain members.
+			if (matrix_value.IsNull()) continue;
+			row_values.Append(chunk.data[agg_col_idx], row_format, row_idx);
+			join_values.Append(chunk.data[join_col_idx], join_format, row_idx);
 			result.values.push_back(matrix_value.GetValue<T>());
 		}
 	}
 	print_side(timing_side, "array-extract", extract_begin, timing_now());
 	const auto row_begin = timing_now();
-	result.row_codes = row_encoder.EncodeBatch(std::move(row_values), timing_side, "row");
+	result.row_codes = row_values.Encode(row_encoder, timing_side, "row");
 	print_side(timing_side, "row-encode", row_begin, timing_now());
 	const auto join_begin = timing_now();
-	result.join_codes = join_encoder.EncodeBatch(std::move(join_values), timing_side, "join");
+	result.join_codes = join_values.Encode(join_encoder, timing_side, "join");
 	print_side(timing_side, "join-encode", join_begin, timing_now());
 	print_side(timing_side, "encoding-total", encoding_begin, timing_now());
 	return result;
