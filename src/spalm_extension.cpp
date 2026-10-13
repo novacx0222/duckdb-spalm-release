@@ -12,6 +12,10 @@
 namespace duckdb {
 
 static bool IsMatMulPattern(LogicalAggregate &agg, LogicalComparisonJoin &join) {
+	// Matrix multiplication and join-domain filtering require INNER JOIN semantics.
+	if (join.join_type != JoinType::INNER) {
+		return false;
+	}
 	// Must have exactly 1 aggregate expression: SUM(...)
 	if (agg.expressions.size() != 1) {
 		return false;
@@ -81,18 +85,18 @@ static bool IsMatMulPattern(LogicalAggregate &agg, LogicalComparisonJoin &join) 
 
 	// Each group-by column and each value column should come from one side of the join
 	// One group-by + one value from LHS, one group-by + one value from RHS
-	int lhs_grp_count = (grp0.binding.table_index == lhs_table ? 1 : 0) +
-	                    (grp1.binding.table_index == lhs_table ? 1 : 0);
-	int rhs_grp_count = (grp0.binding.table_index == rhs_table ? 1 : 0) +
-	                    (grp1.binding.table_index == rhs_table ? 1 : 0);
+	int lhs_grp_count =
+	    (grp0.binding.table_index == lhs_table ? 1 : 0) + (grp1.binding.table_index == lhs_table ? 1 : 0);
+	int rhs_grp_count =
+	    (grp0.binding.table_index == rhs_table ? 1 : 0) + (grp1.binding.table_index == rhs_table ? 1 : 0);
 	if (lhs_grp_count != 1 || rhs_grp_count != 1) {
 		return false;
 	}
 
-	int lhs_val_count = (val0.binding.table_index == lhs_table ? 1 : 0) +
-	                    (val1.binding.table_index == lhs_table ? 1 : 0);
-	int rhs_val_count = (val0.binding.table_index == rhs_table ? 1 : 0) +
-	                    (val1.binding.table_index == rhs_table ? 1 : 0);
+	int lhs_val_count =
+	    (val0.binding.table_index == lhs_table ? 1 : 0) + (val1.binding.table_index == lhs_table ? 1 : 0);
+	int rhs_val_count =
+	    (val0.binding.table_index == rhs_table ? 1 : 0) + (val1.binding.table_index == rhs_table ? 1 : 0);
 	if (lhs_val_count != 1 || rhs_val_count != 1) {
 		return false;
 	}
@@ -122,9 +126,8 @@ void SpalmExtension::InjectSpalm(unique_ptr<LogicalOperator> &plan) {
 			// Extract children before moving comparison_join
 			auto left_child = std::move(comparison_join->children[0]);
 			auto right_child = std::move(comparison_join->children[1]);
-			auto spalm = make_uniq<LogicalSpalm>(std::move(agg_op), std::move(comparison_join),
-			                                       std::move(left_child),
-			                                       std::move(right_child));
+			auto spalm = make_uniq<LogicalSpalm>(std::move(agg_op), std::move(comparison_join), std::move(left_child),
+			                                     std::move(right_child));
 			plan = std::move(spalm);
 		}
 	}

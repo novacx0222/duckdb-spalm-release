@@ -16,6 +16,7 @@
 #include <sstream>
 #include <dirent.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <cstdio>
 
@@ -126,19 +127,158 @@ struct DomainInputBuffer {
 	vector<Value> values;
 };
 
+
+
+// Immutable membership snapshot for filtering either input against a common
+// INNER JOIN domain. Bounded integers use a bitmap; other values use a set.
+struct JoinDomainFilter {
+	JoinDomainFilter(const DomainEncoder &encoder, const LogicalType &type, bool requested) {
+		if (!requested) return;
+		enabled = true;
+		integer_keys = DomainEncoder::SupportsIntegerEncoding(type);
+		for (idx_t code = 0; code < encoder.Size(); ++code) {
+			if (encoder.Decode(code).type() != type) integer_keys = false;
+		}
+		if (!integer_keys) {
+			generic_keys.reserve(encoder.Size());
+			for (idx_t code = 0; code < encoder.Size(); ++code) {
+				if (!encoder.Decode(code).IsNull()) generic_keys.insert(encoder.Decode(code));
+			}
+			key_count = generic_keys.size();
+			return;
+		}
+		vector<int64_t> keys;
+		keys.reserve(encoder.Size());
+		for (idx_t code = 0; code < encoder.Size(); ++code) {
+			if (!encoder.Decode(code).IsNull()) keys.push_back(encoder.Decode(code).GetValue<int64_t>());
+		}
+		key_count = keys.size();
+		if (keys.empty()) return;
+		const auto bounds = std::minmax_element(keys.begin(), keys.end());
+		minimum = *bounds.first;
+		const uint64_t distance = static_cast<uint64_t>(*bounds.second) - static_cast<uint64_t>(minimum);
+		constexpr uint64_t MAX_DIRECT_RANGE = 1ULL << 20;
+		if (distance < MAX_DIRECT_RANGE) {
+			direct = true;
+			range = static_cast<idx_t>(distance + 1);
+			full_range = key_count == range;
+			if (!full_range) {
+				present.assign(range, 0);
+				for (auto key : keys) {
+					present[static_cast<idx_t>(static_cast<uint64_t>(key) - static_cast<uint64_t>(minimum))] = 1;
+				}
+			}
+		} else {
+			hash_keys.reserve(key_count);
+			for (auto key : keys) hash_keys.insert(key);
+		}
+	}
+	bool Contains(int64_t key) const {
+		if (!enabled) return true;
+		if (key_count == 0) return false;
+		if (direct) {
+			const uint64_t offset = static_cast<uint64_t>(key) - static_cast<uint64_t>(minimum);
+			return offset < range && (full_range || present[static_cast<idx_t>(offset)] != 0);
+		}
+		return hash_keys.find(key) != hash_keys.end();
+	}
+	bool ContainsValue(const Value &key) const {
+		return !enabled || generic_keys.find(key) != generic_keys.end();
+	}
+	const char *Path() const {
+		if (!enabled) return "disabled";
+		if (key_count == 0) return "empty";
+		if (!integer_keys) return "value-hash";
+		if (!direct) return "integer-hash";
+		return full_range ? "integer-range" : "integer-bitmap";
+	}
+	bool enabled = false, integer_keys = false, direct = false, full_range = false;
+	idx_t key_count = 0, range = 0;
+	int64_t minimum = 0;
+	vector<uint8_t> present;
+	std::unordered_set<int64_t> hash_keys;
+	value_set_t generic_keys;
+};
+
+// Scan primitive vectors and retain only distinct keys, not one Value per
+// record. Apply the same NULL key/value eligibility as matrix extraction.
+static DomainEncoder CollectJoinDomain(ColumnDataCollection &data, idx_t join_col, idx_t value_col, int side) {
+	const auto begin = timing_now();
+	DataChunk chunk;
+	data.InitializeScanChunk(chunk);
+	DomainInputBuffer input(chunk.data[join_col].GetType(), 0);
+	std::unordered_set<int64_t> integer_keys;
+	value_set_t generic_keys;
+	for (idx_t chunk_index = 0; chunk_index < data.ChunkCount(); ++chunk_index) {
+		data.FetchChunk(chunk_index, chunk);
+		UnifiedVectorFormat keys, values;
+		chunk.data[join_col].ToUnifiedFormat(chunk.size(), keys);
+		chunk.data[value_col].ToUnifiedFormat(chunk.size(), values);
+		for (idx_t i = 0; i < chunk.size(); ++i) {
+			const auto key_index = keys.sel->get_index(i);
+			if (!keys.validity.RowIsValid(key_index) || !values.validity.RowIsValid(values.sel->get_index(i))) continue;
+			if (input.reader) integer_keys.insert(input.reader(keys, key_index));
+			else generic_keys.insert(chunk.data[join_col].GetValue(i));
+		}
+	}
+	if (input.reader) {
+		input.integers.reserve(integer_keys.size());
+		for (auto key : integer_keys) input.integers.push_back(key);
+		input.valid.assign(input.integers.size(), 1);
+	} else {
+		input.values.reserve(generic_keys.size());
+		for (const auto &key : generic_keys) input.values.push_back(key);
+	}
+	print_side(side, "join-domain-collect", begin, timing_now());
+	DomainEncoder result;
+	const auto encode_begin = timing_now();
+	input.Encode(result, side, "join-domain");
+	print_side(side, "join-domain-encode", encode_begin, timing_now());
+	return result;
+}
+
+static DomainEncoder IntersectJoinDomains(const DomainEncoder &first, const DomainEncoder &second) {
+	const auto begin = timing_now();
+	const auto &small = first.Size() <= second.Size() ? first : second;
+	const auto &large = first.Size() <= second.Size() ? second : first;
+	value_set_t keys;
+	keys.reserve(small.Size());
+	for (idx_t i = 0; i < small.Size(); ++i) keys.insert(small.Decode(i));
+	vector<Value> common;
+	common.reserve(small.Size());
+	for (idx_t i = 0; i < large.Size(); ++i) {
+		if (keys.find(large.Decode(i)) != keys.end()) common.push_back(large.Decode(i));
+	}
+	DomainEncoder result;
+	result.EncodeBatch(std::move(common));
+	print_stage("join-domain-intersect", begin, timing_now());
+	printf("[join-intersection-stats] keys1=%llu keys2=%llu common_keys=%llu\n",
+	       static_cast<unsigned long long>(first.Size()), static_cast<unsigned long long>(second.Size()),
+	       static_cast<unsigned long long>(result.Size()));
+	return result;
+}
+
 template<typename T>
 EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
                               idx_t agg_col_idx, idx_t val_col_idx,
-                              DomainEncoder &row_encoder, DomainEncoder &join_encoder, int timing_side) {
+                              DomainEncoder &row_encoder, DomainEncoder &join_encoder, int timing_side,
+                              bool restrict_join_domain = false) {
 	const auto encoding_begin = timing_now();
-	const auto allocate_begin = encoding_begin;
 	EncodedMatrix<T> result;
 	const auto input_count = data.Count();
 	DataChunk chunk;
 	data.InitializeScanChunk(chunk);
-	DomainInputBuffer row_values(chunk.data[agg_col_idx].GetType(), input_count);
-	DomainInputBuffer join_values(chunk.data[join_col_idx].GetType(), input_count);
-	result.values.reserve(input_count);
+	const auto filter_begin = timing_now();
+	JoinDomainFilter join_filter(join_encoder, chunk.data[join_col_idx].GetType(), restrict_join_domain);
+	if (restrict_join_domain) print_side(timing_side, "join-filter-setup", filter_begin, timing_now());
+	const auto allocate_begin = timing_now();
+	// Avoid reserving the complete second input when most keys may be rejected.
+	const auto reserve_count = join_filter.enabled && !join_filter.full_range
+	                              ? std::min(input_count, static_cast<idx_t>(65536)) : input_count;
+	DomainInputBuffer row_values(chunk.data[agg_col_idx].GetType(), reserve_count);
+	DomainInputBuffer join_values(chunk.data[join_col_idx].GetType(), reserve_count);
+	result.values.reserve(reserve_count);
+	idx_t join_candidates = 0, rejected_join_rows = 0;
 
 	print_side(timing_side, "array-allocate", allocate_begin, timing_now());
 	const auto extract_begin = timing_now();
@@ -150,6 +290,13 @@ EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
 		for (idx_t row_idx = 0; row_idx < chunk.size(); ++row_idx) {
 			const auto join_index = join_format.sel->get_index(row_idx);
 			if (!join_format.validity.RowIsValid(join_index)) continue;
+			++join_candidates;
+			if (join_filter.enabled && !(join_filter.integer_keys
+			    ? join_filter.Contains(join_values.reader(join_format, join_index))
+			    : join_filter.ContainsValue(chunk.data[join_col_idx].GetValue(row_idx)))) {
+				++rejected_join_rows;
+				continue;
+			}
 			auto matrix_value = chunk.data[val_col_idx].GetValue(row_idx);
 			// Equality joins reject NULL keys; SUM ignores NULL products.
 			// NULL grouping keys remain valid domain members.
@@ -160,6 +307,13 @@ EncodedMatrix<T> EncodeMatrix(ColumnDataCollection &data, idx_t join_col_idx,
 		}
 	}
 	print_side(timing_side, "array-extract", extract_begin, timing_now());
+	if (restrict_join_domain && timing_side > 0) {
+		printf("[%d-join-filter-stats] path=%s domain_keys=%llu input_rows=%llu join_candidates=%llu "
+		       "rejected_join_rows=%llu encoded_rows=%llu\n", timing_side, join_filter.Path(),
+		       static_cast<unsigned long long>(join_filter.key_count), static_cast<unsigned long long>(input_count),
+		       static_cast<unsigned long long>(join_candidates), static_cast<unsigned long long>(rejected_join_rows),
+		       static_cast<unsigned long long>(result.values.size()));
+	}
 	const auto row_begin = timing_now();
 	result.row_codes = row_values.Encode(row_encoder, timing_side, "row");
 	print_side(timing_side, "row-encode", row_begin, timing_now());
@@ -375,6 +529,8 @@ public:
 	struct timespec prepare_start;
 
 	unique_ptr<ColumnDataCollection> mat_data;
+	unique_ptr<ColumnDataCollection> first_input;
+	double first_collect_ms = 0.0;
 	ColumnDataAppendState append_state;
 	double combine_ms = 0.0;
 	double operator_combine_ms = 0.0;
@@ -424,58 +580,12 @@ SinkCombineResultType PhysicalSpalm::Combine(ExecutionContext &context, Operator
 SinkFinalizeType PhysicalSpalm::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                             OperatorSinkFinalizeInput &input) const {
 	auto &sink = input.global_state.Cast<PhysicalSpalmGlobalState>();
-	double seconds, nanoseconds, elapsed_ms;
-	struct timespec f_start;
-	clock_gettime(CLOCK_MONOTONIC, &sink.end);
-	seconds = sink.end.tv_sec - sink.start.tv_sec;
-	nanoseconds = sink.end.tv_nsec - sink.start.tv_nsec;
-	elapsed_ms = (seconds * 1000.0) + (nanoseconds / 1000000.0);
-	printf("[1-collect-input] %.3f ms\n", elapsed_ms);
+	sink.first_collect_ms = get_ms(sink.start, timing_now());
+	printf("[1-collect-input] %.3f ms\n", sink.first_collect_ms);
 	printf("[1-combine-input] %.3f ms\n", sink.combine_ms);
-
-	const int num_threads = sink.threads;
-	omp_set_num_threads(num_threads);
-
-	auto encoded_float = EncodedMatrix<float>();
-	auto encoded_double = EncodedMatrix<double>();
-	if (sink.use_float) {
-		encoded_float = EncodeMatrix<float>(*sink.mat_data, rhs_join_idx, rhs_agg_idx, rhs_val_idx,
-		                                    sink.rhs_agg_encoder, sink.join_encoder, 1);
-	} else {
-		encoded_double = EncodeMatrix<double>(*sink.mat_data, rhs_join_idx, rhs_agg_idx, rhs_val_idx,
-		                                      sink.rhs_agg_encoder, sink.join_encoder, 1);
-	}
-
-	const int sink_nnz = sink.use_float ? static_cast<int>(encoded_float.Count())
-	                                    : static_cast<int>(encoded_double.Count());
-	const int M = static_cast<int>(sink.rhs_agg_encoder.Size());
-	sink.M = M;
-	printf("[SPALM Finalize] encoded M=%d, K_so_far=%llu, nnz=%d\n", M,
-	       static_cast<unsigned long long>(sink.join_encoder.Size()), sink_nnz);
-
-	const auto csr_allocate_begin = timing_now();
-	// Allocate sink CSR arrays
-	sink.Ri = make_uniq_array<int>(M + 1);
-	memset(sink.Ri.get(), 0, sizeof(int) * (M + 1));
-	sink.Rk = make_uniq_array<int>(sink_nnz);
-	if (sink.use_float) {
-		sink.Rv_f = make_uniq_array<float>(sink_nnz);
-	} else {
-		sink.Rv_d = make_uniq_array<double>(sink_nnz);
-	}
-
-	print_stage("1-csr-allocate", csr_allocate_begin, timing_now());
-	clock_gettime(CLOCK_MONOTONIC, &f_start);
-	if (sink.use_float) {
-		BuildCSR<float>(sink.Ri.get(), sink.Rk.get(), sink.Rv_f.get(), encoded_float, M, num_threads, 1);
-	} else {
-		BuildCSR<double>(sink.Ri.get(), sink.Rk.get(), sink.Rv_d.get(), encoded_double, M, num_threads, 1);
-	}
-
-	clock_gettime(CLOCK_MONOTONIC, &sink.end);
-	print_stage("1-prepare-total", sink.start, sink.end);
-
-	// Reinitialize mat_data with LHS child types for the operator phase
+	// Keep the first input until the second is collected. CSR construction
+	// is deferred so both inputs can use the same intersection dictionary.
+	sink.first_input = std::move(sink.mat_data);
 	sink.mat_data = make_uniq<ColumnDataCollection>(sink.context_ref, sink.lhs_child_types);
 	sink.mat_data->InitializeAppend(sink.append_state);
 	clock_gettime(CLOCK_MONOTONIC, &sink.start);
@@ -503,23 +613,17 @@ unique_ptr<OperatorState> PhysicalSpalm::GetOperatorState(ExecutionContext &cont
 class PhysicalSpalmGlobalSourceState : public GlobalSourceState {
 public:
 	explicit PhysicalSpalmGlobalSourceState(const PhysicalSpalm &op)
-	    : next_row(0), total_rows(0), num_threads(1), chunk_rows(200) {
+	    : next_row(0), num_threads(1) {
 		if (op.sink_state) {
 			auto &sink = op.sink_state->Cast<PhysicalSpalmGlobalState>();
-			total_rows  = (idx_t)sink.M;
-			num_threads = (idx_t)sink.threads;
-			chunk_rows  = std::max((idx_t)1,
-			              std::min((idx_t)200, (total_rows + num_threads - 1) / num_threads));
+			num_threads = static_cast<idx_t>(sink.threads);
 		}
 	}
 
 	idx_t MaxThreads() override { return num_threads; }
-
 	std::atomic<idx_t> next_row;
 	std::atomic<idx_t> threads_finished{0};
-	idx_t total_rows;
 	idx_t num_threads;
-	idx_t chunk_rows;
 };
 
 class PhysicalSpalmLocalSourceState : public LocalSourceState {
@@ -558,16 +662,68 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 			const int num_threads = sink.threads;
 			omp_set_num_threads(num_threads);
 
-			print_stage("2-collect-input", sink.start, timing_now());
+			const auto second_collect_ms = get_ms(sink.start, timing_now());
+			printf("[2-collect-input] %.3f ms\n", second_collect_ms);
 			printf("[2-combine-input] %.3f ms\n", sink.operator_combine_ms);
+			const auto intersection_begin = timing_now();
+			{
+				auto first_domain = CollectJoinDomain(*sink.first_input, rhs_join_idx, rhs_val_idx, 1);
+				auto second_domain = CollectJoinDomain(*sink.mat_data, lhs_join_idx, lhs_val_idx, 2);
+				sink.join_encoder = IntersectJoinDomains(first_domain, second_domain);
+			}
+			print_stage("join-intersection-total", intersection_begin, timing_now());
+			const auto first_prepare_begin = timing_now();
+			{
+				auto encoded_float = EncodedMatrix<float>();
+				auto encoded_double = EncodedMatrix<double>();
+				if (sink.use_float) {
+					encoded_float = EncodeMatrix<float>(*sink.first_input, rhs_join_idx, rhs_agg_idx, rhs_val_idx,
+					                                    sink.rhs_agg_encoder, sink.join_encoder, 1, true);
+				} else {
+					encoded_double = EncodeMatrix<double>(*sink.first_input, rhs_join_idx, rhs_agg_idx, rhs_val_idx,
+					                                      sink.rhs_agg_encoder, sink.join_encoder, 1, true);
+				}
+
+				const int sink_nnz = sink.use_float ? static_cast<int>(encoded_float.Count())
+				                                    : static_cast<int>(encoded_double.Count());
+				const int M = static_cast<int>(sink.rhs_agg_encoder.Size());
+				sink.M = M;
+				printf("[SPALM Finalize] encoded M=%d, K_so_far=%llu, nnz=%d\n", M,
+				       static_cast<unsigned long long>(sink.join_encoder.Size()), sink_nnz);
+
+				const auto csr_allocate_begin = timing_now();
+				// Allocate sink CSR arrays
+				sink.Ri = make_uniq_array<int>(M + 1);
+				memset(sink.Ri.get(), 0, sizeof(int) * (M + 1));
+				sink.Rk = make_uniq_array<int>(sink_nnz);
+				if (sink.use_float) {
+					sink.Rv_f = make_uniq_array<float>(sink_nnz);
+				} else {
+					sink.Rv_d = make_uniq_array<double>(sink_nnz);
+				}
+
+				print_stage("1-csr-allocate", csr_allocate_begin, timing_now());
+				clock_gettime(CLOCK_MONOTONIC, &f_start);
+				if (sink.use_float) {
+					BuildCSR<float>(sink.Ri.get(), sink.Rk.get(), sink.Rv_f.get(), encoded_float, M, num_threads, 1);
+				} else {
+					BuildCSR<double>(sink.Ri.get(), sink.Rk.get(), sink.Rv_d.get(), encoded_double, M, num_threads, 1);
+				}
+
+				const auto release_begin = timing_now();
+				sink.first_input.reset();
+				print_side(1, "input-deallocate", release_begin, timing_now());
+			}
+			printf("[1-prepare-total] %.3f ms\n", sink.first_collect_ms + get_ms(first_prepare_begin, timing_now()));
+			const auto second_prepare_begin = timing_now();
 			auto encoded_float = EncodedMatrix<float>();
 			auto encoded_double = EncodedMatrix<double>();
 			if (sink.use_float) {
 				encoded_float = EncodeMatrix<float>(*sink.mat_data, lhs_join_idx, lhs_agg_idx, lhs_val_idx,
-				                                    sink.lhs_agg_encoder, sink.join_encoder, 2);
+				                                    sink.lhs_agg_encoder, sink.join_encoder, 2, true);
 			} else {
 				encoded_double = EncodeMatrix<double>(*sink.mat_data, lhs_join_idx, lhs_agg_idx, lhs_val_idx,
-				                                      sink.lhs_agg_encoder, sink.join_encoder, 2);
+				                                      sink.lhs_agg_encoder, sink.join_encoder, 2, true);
 			}
 
 			const int op_nnz = sink.use_float ? static_cast<int>(encoded_float.Count())
@@ -588,6 +744,11 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 			// the SPALM library with zero-sized dimensions; not every backend
 			// accepts them even though the SQL result is well-defined.
 			if (sink.M == 0 || N == 0 || K == 0) {
+				const auto release_begin = timing_now();
+				sink.mat_data.reset();
+				print_side(2, "input-deallocate", release_begin, timing_now());
+				printf("[2-prepare-total] %.3f ms\n", second_collect_ms + get_ms(second_prepare_begin, timing_now()));
+				print_stage("prepare-total", sink.prepare_start, timing_now());
 				sink.done = true;
 				clock_gettime(CLOCK_MONOTONIC, &sink.start);
 				sink.condition.notify_all();
@@ -635,8 +796,11 @@ OperatorFinalizeResultType PhysicalSpalm::FinalExecute(ExecutionContext &context
 				BuildCSR<double>(sink.Sj.get(), sink.Sk.get(), sink.Sv_d.get(), encoded_double, N, num_threads, 2);
 			}
 
+			const auto release_begin = timing_now();
+			sink.mat_data.reset();
+			print_side(2, "input-deallocate", release_begin, timing_now());
 			clock_gettime(CLOCK_MONOTONIC, &sink.end);
-			print_stage("2-prepare-total", sink.start, sink.end);
+			printf("[2-prepare-total] %.3f ms\n", second_collect_ms + get_ms(second_prepare_begin, sink.end));
 
 			const auto library_setup_begin = timing_now();
 			// Load spalm library from path configured in spalm.conf.
@@ -736,7 +900,10 @@ SourceResultType PhysicalSpalm::GetData(ExecutionContext &context, DataChunk &ou
 	auto &lstate = input.local_state.Cast<PhysicalSpalmLocalSourceState>();
 
 	const idx_t N         = (idx_t)sink.N;
-	const idx_t total_rows = gstate.total_rows;  // M
+	// Dimensions are finalized after both inputs have been collected.
+	const idx_t total_rows = static_cast<idx_t>(sink.M);
+	const idx_t chunk_rows = std::max(static_cast<idx_t>(1),
+	    std::min(static_cast<idx_t>(200), (total_rows + gstate.num_threads - 1) / gstate.num_threads));
 	const idx_t vec_size  = 2048;
 
 	output.SetCapacity(vec_size);
@@ -748,9 +915,9 @@ SourceResultType PhysicalSpalm::GetData(ExecutionContext &context, DataChunk &ou
 
 		while (idx < vec_size) {
 			if (lstate.curr_pos >= lstate.end_pos) {
-				idx_t row_start = gstate.next_row.fetch_add(gstate.chunk_rows);
+				idx_t row_start = gstate.next_row.fetch_add(chunk_rows);
 				if (row_start >= total_rows) break;
-				idx_t row_end    = std::min(row_start + gstate.chunk_rows, total_rows);
+				idx_t row_end    = std::min(row_start + chunk_rows, total_rows);
 				lstate.curr_pos  = row_start * N;
 				lstate.end_pos   = row_end   * N;
 			}
@@ -772,9 +939,9 @@ SourceResultType PhysicalSpalm::GetData(ExecutionContext &context, DataChunk &ou
 
 		while (idx < vec_size) {
 			if (lstate.curr_pos >= lstate.end_pos) {
-				idx_t row_start = gstate.next_row.fetch_add(gstate.chunk_rows);
+				idx_t row_start = gstate.next_row.fetch_add(chunk_rows);
 				if (row_start >= total_rows) break;
-				idx_t row_end    = std::min(row_start + gstate.chunk_rows, total_rows);
+				idx_t row_end    = std::min(row_start + chunk_rows, total_rows);
 				lstate.curr_pos  = row_start * N;
 				lstate.end_pos   = row_end   * N;
 			}
